@@ -38,6 +38,7 @@ from sklearn.metrics import classification_report
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
+
 # ──────────────────────────────────────────────────────────────
 # Configuration
 # ──────────────────────────────────────────────────────────────
@@ -692,6 +693,148 @@ class SimpleLoss(nn.Module):
         }
         return total, metrics
     
+class DirectionalAuxiliaryLoss(nn.Module):
+    """
+    Multi-objective loss that combines:
+    1. Direction prediction (weighted cross-entropy)
+    2. Wrong-direction penalty (don't bet against the trend)
+    3. Magnitude awareness (bigger moves = more important to get right)
+    4. Volatility prediction (auxiliary task for regime detection)
+    5. Confidence calibration (teach model when to say "I don't know")
+    """
+    def __init__(self, cfg: Config, class_counts: np.ndarray = None):
+        super().__init__()
+        
+        # Class weights (inverse frequency)
+        if class_counts is None:
+            class_counts = np.array([0.25, 0.50, 0.25])
+        
+        total = class_counts.sum()
+        weights = total / (len(class_counts) * class_counts + 1e-10)
+        weights = weights / weights.mean()
+        weights = np.clip(weights, 0.5, 3.0)
+        
+        print(f"  Class weights: Down={weights[0]:.2f}, Flat={weights[1]:.2f}, Up={weights[2]:.2f}")
+        self.register_buffer("class_weights", torch.FloatTensor(weights))
+        
+        # Hyperparameters
+        self.direction_penalty = 3.0    # Wrong direction is 3x worse than weak confidence
+        self.magnitude_scale = 100.0    # Scale returns from [0.0001] to [0.01] range
+        self.vol_weight = 0.15          # Volatility task weight
+        self.conf_weight = 0.1          # Confidence calibration weight
+
+    def forward(self, outputs, targets, aux_targets, sample_weights):
+        logits = outputs["logits"]
+        probs = outputs["probs"]
+        conf = outputs["confidence"]
+        vol_pred = outputs["vol_pred"]
+        
+        labels = targets.squeeze(-1)
+        abs_ret = aux_targets[:, 0]     # Magnitude of the move
+        fut_vol = aux_targets[:, 1]     # Realized future volatility
+        sw = sample_weights.squeeze(-1)
+        
+        batch_size = labels.size(0)
+        
+        # ══════════════════════════════════════════════════════════
+        # 1. BASE CLASSIFICATION LOSS (Weighted Cross-Entropy)
+        # ══════════════════════════════════════════════════════════
+        ce_loss = F.cross_entropy(
+            logits, labels, 
+            weight=self.class_weights, 
+            reduction='none'
+        )
+        
+        # ══════════════════════════════════════════════════════════
+        # 2. DIRECTIONAL PENALTY (Punish wrong-side predictions)
+        # ══════════════════════════════════════════════════════════
+        # If true=Up but predicted=Down (or vice versa), this is catastrophic
+        pred_class = probs.argmax(dim=-1)
+        
+        # Wrong direction = (true=Down AND pred=Up) OR (true=Up AND pred=Down)
+        wrong_direction = (
+            ((labels == 0) & (pred_class == 2)) |  # Predicted rally in a dump
+            ((labels == 2) & (pred_class == 0))    # Predicted dump in a rally
+        ).float()
+        
+        # Apply penalty multiplier
+        direction_penalty = 1.0 + wrong_direction * self.direction_penalty
+        
+        # ══════════════════════════════════════════════════════════
+        # 3. MAGNITUDE WEIGHTING (Big moves are more important)
+        # ══════════════════════════════════════════════════════════
+        # abs_ret is typically 0.0001 to 0.05 (1bp to 500bp)
+        # Scale it so: 10bp move → weight=1.0, 100bp move → weight=10.0
+        magnitude_weight = 1.0 + abs_ret * self.magnitude_scale
+        
+        # ══════════════════════════════════════════════════════════
+        # 4. COMBINE INTO PRIMARY LOSS
+        # ══════════════════════════════════════════════════════════
+        primary_loss = (
+            ce_loss * direction_penalty * magnitude_weight * sw
+        ).mean()
+        
+        # ══════════════════════════════════════════════════════════
+        # 5. AUXILIARY: VOLATILITY PREDICTION (Huber Loss)
+        # ══════════════════════════════════════════════════════════
+        # Teaching the model to predict future volatility helps it:
+        # - Recognize regime changes (low→high vol = dangerous)
+        # - Adjust confidence appropriately (high vol = lower confidence)
+        valid_vol = ~torch.isnan(fut_vol)
+        if valid_vol.sum() > 0:
+            vol_loss = F.huber_loss(
+                vol_pred[valid_vol], 
+                fut_vol[valid_vol], 
+                delta=1.0,
+                reduction='mean'
+            )
+        else:
+            vol_loss = torch.tensor(0.0, device=logits.device)
+        
+        # ══════════════════════════════════════════════════════════
+        # 6. CONFIDENCE CALIBRATION (Binary Cross-Entropy)
+        # ══════════════════════════════════════════════════════════
+        # Train the confidence head to output:
+        #   1.0 when prediction is correct
+        #   0.0 when prediction is wrong
+        # This creates a second "sanity check" network
+        is_correct = (pred_class == labels).float()
+        conf_loss = F.binary_cross_entropy(conf, is_correct, reduction='mean')
+        
+        # ══════════════════════════════════════════════════════════
+        # 7. TOTAL LOSS (Weighted combination)
+        # ══════════════════════════════════════════════════════════
+        total_loss = (
+            primary_loss +                          # Classification + direction + magnitude
+            self.vol_weight * vol_loss +            # Auxiliary volatility task
+            self.conf_weight * conf_loss            # Confidence calibration
+        )
+        
+        # ══════════════════════════════════════════════════════════
+        # 8. METRICS (for logging/debugging)
+        # ══════════════════════════════════════════════════════════
+        with torch.no_grad():
+            # Entropy (measure of uncertainty)
+            entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1).mean()
+            
+            # What % of predictions were wrong-direction?
+            wrong_dir_pct = wrong_direction.mean()
+            
+            # Average magnitude weight applied
+            avg_mag_weight = magnitude_weight.mean()
+        
+        metrics = {
+            "primary": primary_loss.item(),
+            "vol_loss": vol_loss.item() if isinstance(vol_loss, torch.Tensor) else 0.0,
+            "conf_loss": conf_loss.item(),
+            "entropy": entropy.item(),
+            "mean_conf": conf.mean().item(),
+            "wrong_dir_pct": wrong_dir_pct.item(),
+            "avg_mag_weight": avg_mag_weight.item(),
+        }
+        
+        return total_loss, metrics
+
 # ──────────────────────────────────────────────────────────────
 # §7  Training Engine
 # ──────────────────────────────────────────────────────────────
@@ -780,8 +923,21 @@ class Trainer:
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(
             optim, T_max=cfg.max_epochs, eta_min=1e-6
         )
+
+        # Calculate class distribution
+        valid_labels = tr_lab[~np.isnan(tr_lab)]
+        class_counts = np.array([
+            (valid_labels == 0).sum(),
+            (valid_labels == 1).sum(),
+            (valid_labels == 2).sum(),
+        ]).astype(np.float64)
+        
+        print(f"  Class distribution: Down={class_counts[0]:.0f}, "
+              f"Flat={class_counts[1]:.0f}, Up={class_counts[2]:.0f}")
+
         #criterion = DirectionalFocalLoss(cfg).to(self.device)
-        criterion = SimpleLoss(cfg).to(self.device) # simpler loss for stable training
+        #criterion = SimpleLoss(cfg).to(self.device) # simpler loss for stable training
+        criterion = DirectionalAuxiliaryLoss(cfg, class_counts).to(self.device) #imporved Loss with auxiliary volatility prediction and confidence calibration.
         
         best_val, patience_ctr = float("inf"), 0
         hist = dict(train_loss=[], val_loss=[], val_entropy=[], val_acc=[])
