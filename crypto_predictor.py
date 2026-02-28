@@ -51,8 +51,8 @@ class Config:
     max_missing_bars_fill: int = 2       # forward-fill up to N consecutive gaps
 
     # Labels — derived strictly from FUTURE prices
-    horizon_bars: int = 3                # predict 3 bars ahead (15 min)
-    label_threshold_bps: float = 15.0    # dead-zone: 15 bps > typical fees+slippage
+    horizon_bars: int = 12                # predict 3 bars ahead (15 min)
+    label_threshold_bps: float = 35.0    # dead-zone: 15 bps > typical fees+slippage
     # Classes: 0=Down, 1=Flat, 2=Up
 
     # Features
@@ -62,9 +62,9 @@ class Config:
 
     # Model (kept small for CPU stability)
     input_features: int = 0              # set dynamically after feature build
-    hidden_dim: int = 64
-    num_layers: int = 2
-    dropout: float = 0.3
+    hidden_dim: int = 32
+    num_layers: int = 1
+    dropout: float = 0.5
     num_classes: int = 3
 
     # Training
@@ -75,16 +75,18 @@ class Config:
     patience: int = 8
 
     # Walk-forward windows
-    train_bars: int = 8640               # ~30 days of 5-min bars
-    val_bars: int = 2880                 # ~10 days
-    step_bars: int = 1440                # ~5 days slide
+    #train_bars: int = 8640               # ~30 days of 5-min bars
+    train_bars: int = 20920              # around 3 months to have enough data after feature engineering and label construction
+    #val_bars: int = 2880                 # ~10 days
+    val_bars: int = 8640                 # ~30 days for more robust validation
+    step_bars: int = 8640                # ~30 day slide, no overlap between train/val
 
     # Loss function
     focal_gamma: float = 2.0             # focal loss focusing parameter
     direction_penalty_weight: float = 2.5 # extra cost for wrong-direction errors
     entropy_reg_weight: float = 0.1      # prevent overconfidence collapse
-    flat_class_weight: float = 0.4       # downweight the dominant flat class
-    aux_vol_loss_weight: float = 0.2     # auxiliary volatility prediction
+    flat_class_weight: float = 1.0       # downweight the dominant flat class
+    aux_vol_loss_weight: float = 0.0     # auxiliary volatility prediction
 
     # Paths
     checkpoint_dir: str = "checkpoints"
@@ -602,7 +604,8 @@ class DirectionalFocalLoss(nn.Module):
         dir_mult = 1.0 + wrong_dir.float() * self.dir_pen
 
         # ── Magnitude weighting ─────────────────────────────────
-        mag_w = 1.0 + abs_ret * 100.0
+        #mag_w = 1.0 + abs_ret * 100.0
+        mag_w = 1.0 + np.tanh(abs_ret * 10.0) #no extreme weights for outliers
 
         primary = (focal * mag_w * dir_mult * sw).mean()
 
@@ -619,7 +622,8 @@ class DirectionalFocalLoss(nn.Module):
         vol_loss = (F.huber_loss(vpred[valid], fut_vol[valid], delta=1.0)
                     if valid.any() else torch.tensor(0.0))
 
-        total = primary + ent_reg + 0.1 * conf_loss + self.vol_w * vol_loss
+        #total = primary + ent_reg + 0.1 * conf_loss + self.vol_w * vol_loss
+        total = primary + 0.1 * conf_loss + self.vol_w * vol_loss # no entropy regularization for now, to see if it learns confidence at all
 
         metrics = {
             "primary":    primary.item(),
@@ -630,6 +634,45 @@ class DirectionalFocalLoss(nn.Module):
         }
         return total, metrics
 
+
+class SimpleLoss(nn.Module):
+    """
+    Simplified loss to stabilize training. 
+    Standard Cross Entropy + basic Confidence Calibration.
+    """
+    def __init__(self, cfg: Config):
+        super().__init__()
+        # 1.0 for all classes ensures we don't punish the model for predicting "Flat"
+        cw = torch.FloatTensor([1.0, cfg.flat_class_weight, 1.0])
+        self.register_buffer("class_weights", cw)
+
+    def forward(self, outputs, targets, aux_targets, sample_weights):
+        logits = outputs["logits"]
+        conf   = outputs["confidence"]
+        labels = targets.squeeze(-1)
+
+        # Standard Cross Entropy
+        # We ignore sample_weights for now to ensure stable convergence
+        ce = F.cross_entropy(logits, labels, weight=self.class_weights)
+
+        # Simple Confidence Calibration (Binary Cross Entropy)
+        # Did the confidence head predict whether the class head was right?
+        pred_cls = outputs["probs"].argmax(dim=-1)
+        correct = (pred_cls == labels).float()
+        conf_loss = F.binary_cross_entropy(conf, correct)
+
+        # Total Loss (90% classification, 10% calibration)
+        total = ce + 0.1 * conf_loss
+
+        metrics = {
+            "primary":    ce.item(),
+            "conf_loss":  conf_loss.item(),
+            "mean_conf":  conf.mean().item(),
+            # Placeholders to keep logging working
+            "entropy":    0.0,
+            "vol_loss":   0.0,
+        }
+        return total, metrics
 # ──────────────────────────────────────────────────────────────
 # §7  Training Engine
 # ──────────────────────────────────────────────────────────────
@@ -711,8 +754,9 @@ class Trainer:
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(
             optim, T_max=cfg.max_epochs, eta_min=1e-6
         )
-        criterion = DirectionalFocalLoss(cfg).to(self.device)
-
+        #criterion = DirectionalFocalLoss(cfg).to(self.device)
+        criterion = SimpleLoss(cfg).to(self.device) # simpler loss for stable training
+        
         best_val, patience_ctr = float("inf"), 0
         hist = dict(train_loss=[], val_loss=[], val_entropy=[], val_acc=[])
 
@@ -1039,12 +1083,18 @@ def predict(model: CryptoPredictor, features: np.ndarray,
     names = ["DOWN", "FLAT", "UP"]
 
     # No-edge detection
-    no_edge = (
-        probs[1] > 0.45
-        or conf < 0.35
-        or H_norm > 0.85
-        or probs.max() < 0.45
-    )
+    #no_edge = (
+    #    probs[1] > 0.45
+    #    or conf < 0.35
+    #    or H_norm > 0.85
+    #    or probs.max() < 0.45
+    #)
+
+    is_decisive = probs.max() > 0.50
+    is_confident = conf > 0.50
+    not_confused_by_flat = (probs[1] < 0.35) if pred != 1 else True
+
+    no_edge = not (is_decisive and is_confident and not_confused_by_flat)
 
     return {
         "direction":      names[pred],
