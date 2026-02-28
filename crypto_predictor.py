@@ -46,6 +46,12 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 class Config:
     """All hyperparameters in one place. No magic numbers scattered in code."""
 
+    num_workers: int = 4              # CPU cores for data loading
+    pin_memory: bool = True           # Faster GPU transfer (if using GPU)
+    
+    # For CPU-only training
+    torch_threads: int = 4            # PyTorch computation threads
+
     # Data
     bar_interval_minutes: int = 5
     max_missing_bars_fill: int = 12       # forward-fill up to N consecutive gaps
@@ -749,13 +755,20 @@ class Trainer:
             print(f"  Fold {fold_id}: insufficient data — skipping")
             return None, {}
 
+        # DataLoaders with sequential batching and parallel workers
+
         train_loader = DataLoader(
             train_ds,
             batch_sampler=SequentialBatchSampler(len(train_ds), cfg.batch_size),
+            num_workers=cfg.num_workers,      # NEW: parallel data loading
+            pin_memory=cfg.pin_memory,        # NEW: faster memory transfer
+            persistent_workers=True,           # NEW: keep workers alive between epochs
         )
         val_loader = DataLoader(
             val_ds,
             batch_sampler=SequentialBatchSampler(len(val_ds), cfg.batch_size),
+            num_workers=cfg.num_workers,
+            pin_memory=cfg.pin_memory,
         )
 
         # Fresh model + optimizer (reset between folds)
@@ -1189,6 +1202,8 @@ def generate_synthetic_data(n_bars: int = 20_000) -> pd.DataFrame:
 
 
 def main():
+    torch.set_num_threads(6)  # Use 4 CPU cores for computation
+
     ap = argparse.ArgumentParser(description="Crypto Direction Predictor")
     ap.add_argument("--data",      type=str,   default=None)
     ap.add_argument("--demo",      action="store_true")
