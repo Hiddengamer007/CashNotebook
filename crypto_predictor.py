@@ -133,6 +133,11 @@ def load_and_validate_data(path: str, cfg: Config) -> pd.DataFrame:
     else:
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
 
+    df = df.dropna(subset=["timestamp"])
+    
+    if df.empty:
+        raise ValueError("No valid timestamps found in the CSV. Check your date format.")
+
     df = df.sort_values("timestamp").reset_index(drop=True)
 
     # ---- Build complete time grid (no gaps) ----
