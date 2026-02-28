@@ -637,42 +637,55 @@ class DirectionalFocalLoss(nn.Module):
 
 class SimpleLoss(nn.Module):
     """
-    Simplified loss to stabilize training. 
-    Standard Cross Entropy + basic Confidence Calibration.
+    Simplified loss with inverse-frequency class weighting.
+    Automatically balances rare Up/Down classes against dominant Flat.
     """
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, class_counts: np.ndarray = None):
         super().__init__()
-        # 1.0 for all classes ensures we don't punish the model for predicting "Flat"
-        cw = torch.FloatTensor([1.0, cfg.flat_class_weight, 1.0])
-        self.register_buffer("class_weights", cw)
+        
+        # Default: assume roughly 25% Down, 50% Flat, 25% Up
+        if class_counts is None:
+            class_counts = np.array([0.25, 0.50, 0.25])
+        
+        # Inverse frequency weighting
+        # Flat (50%) gets weight ~1.0, Down/Up (25%) get weight ~2.0
+        total = class_counts.sum()
+        weights = total / (len(class_counts) * class_counts + 1e-10)
+        
+        # Normalize so mean weight = 1.0
+        weights = weights / weights.mean()
+        
+        # Cap maximum weight to prevent instability
+        weights = np.clip(weights, 0.5, 3.0)
+        
+        print(f"  Class weights: Down={weights[0]:.2f}, Flat={weights[1]:.2f}, Up={weights[2]:.2f}")
+        
+        self.register_buffer("class_weights", torch.FloatTensor(weights))
 
     def forward(self, outputs, targets, aux_targets, sample_weights):
         logits = outputs["logits"]
-        conf   = outputs["confidence"]
+        conf = outputs["confidence"]
         labels = targets.squeeze(-1)
 
-        # Standard Cross Entropy
-        # We ignore sample_weights for now to ensure stable convergence
+        # Weighted Cross Entropy
         ce = F.cross_entropy(logits, labels, weight=self.class_weights)
 
-        # Simple Confidence Calibration (Binary Cross Entropy)
-        # Did the confidence head predict whether the class head was right?
+        # Confidence Calibration
         pred_cls = outputs["probs"].argmax(dim=-1)
         correct = (pred_cls == labels).float()
         conf_loss = F.binary_cross_entropy(conf, correct)
 
-        # Total Loss (90% classification, 10% calibration)
         total = ce + 0.1 * conf_loss
 
         metrics = {
-            "primary":    ce.item(),
-            "conf_loss":  conf_loss.item(),
-            "mean_conf":  conf.mean().item(),
-            # Placeholders to keep logging working
-            "entropy":    0.0,
-            "vol_loss":   0.0,
+            "primary": ce.item(),
+            "conf_loss": conf_loss.item(),
+            "mean_conf": conf.mean().item(),
+            "entropy": 0.0,
+            "vol_loss": 0.0,
         }
         return total, metrics
+    
 # ──────────────────────────────────────────────────────────────
 # §7  Training Engine
 # ──────────────────────────────────────────────────────────────
