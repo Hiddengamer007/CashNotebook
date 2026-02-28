@@ -48,7 +48,7 @@ class Config:
 
     # Data
     bar_interval_minutes: int = 5
-    max_missing_bars_fill: int = 2       # forward-fill up to N consecutive gaps
+    max_missing_bars_fill: int = 12       # forward-fill up to N consecutive gaps
 
     # Labels — derived strictly from FUTURE prices
     horizon_bars: int = 12                # predict 3 bars ahead (15 min)
@@ -959,6 +959,19 @@ def run_walk_forward(df: pd.DataFrame, cfg: Config):
     print("\n" + "=" * 60 + "\nBUILDING FEATURES\n" + "=" * 60)
     feat_df = build_features(df, cfg)
 
+        # --- ADD THIS BLOCK ---
+    # 1. Forward fill feature gaps (regime continuity)
+    feat_df = feat_df.fillna(method="ffill")
+    # 2. Fill remaining startup NaNs (start of file) with 0
+    feat_df = feat_df.fillna(0.0)
+    
+    # Check if we still have NaNs (Should be 0)
+    nans = feat_df.isna().sum().sum()
+    if nans > 0:
+        print(f"WARNING: Feature matrix still contains {nans} NaNs. Force filling with 0.")
+        feat_df = feat_df.fillna(0.0)
+    # ----------------------
+
     print("\n" + "=" * 60 + "\nBUILDING LABELS\n" + "=" * 60)
     lab_df = build_labels(df, cfg)
 
@@ -1090,8 +1103,8 @@ def predict(model: CryptoPredictor, features: np.ndarray,
     #    or probs.max() < 0.45
     #)
 
-    is_decisive = probs.max() > 0.50
-    is_confident = conf > 0.50
+    is_decisive = probs.max() > 0.55 #increased from 0.5
+    is_confident = conf > 0.55 #increased from 0.5
     not_confused_by_flat = (probs[1] < 0.35) if pred != 1 else True
 
     no_edge = not (is_decisive and is_confident and not_confused_by_flat)
